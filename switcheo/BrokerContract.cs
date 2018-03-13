@@ -11,7 +11,6 @@ namespace switcheo
     {
         public delegate object NEP5Contract(string method, object[] args);
 
-        // Events
         [DisplayName("created")]
         public static event Action<byte[], byte[], byte[], BigInteger, byte[], BigInteger> Created; // (address, offerHash, offerAssetID, offerAmount, wantAssetID, wantAmount)
 
@@ -27,18 +26,14 @@ namespace switcheo
         [DisplayName("transferred")]
         public static event Action<byte[], byte[], BigInteger> Transferred; // (address, assetID, amount)
 
-        [DisplayName("withdrawing")]
-        public static event Action<byte[], byte[], BigInteger> Withdrawing; // (address, assetID, amount)
-
         [DisplayName("withdrawn")]
         public static event Action<byte[], byte[], BigInteger> Withdrawn; // (address, assetID, amount)
 
-        // Broker Settings & Hardcaps
         private static readonly byte[] Owner = "AHDfSLZANnJ4N9Rj3FCokP14jceu3u7Bvw".ToScriptHash();
         private static readonly byte[] NativeToken = "AYdPyCbHS3MZoJDeZSntgdnDbpa5ScXade".ToScriptHash();
         private const ulong feeFactor = 1000000; // 1 => 0.0001%
         private const int maxFee = 5000; // 5000/1000000 = 0.5%
-        private const int bucketDuration = 82800; // 82800secs = 23hrs
+        private const int stakeDuration = 82800; // 82800secs = 23hrs
         private const int nativeTokenDiscount = 2; // 1/2 => 50%
 
         // Contract States
@@ -50,26 +45,19 @@ namespace switcheo
         private static readonly byte[] SystemAsset = { 0x99 };
         private static readonly byte[] NEP5 = { 0x98 };
 
-        // Native Token Flags
+        // Flags / Byte Constants
+        private static readonly byte[] Empty = { };
+        private static readonly byte[] Withdrawing = { 0x50 };
+        private static readonly byte[] FeesAccumulated = { 0x60 };
+        private static readonly byte[] StakedAmount = { 0x61 };
+        private static readonly byte[] StakedTime = { 0x62 };
+        private static readonly byte[] StakedTotal = { 0x63 };
         private static readonly byte[] Native = { 0x70 };
         private static readonly byte[] Foreign = { 0x71 };
-
-        // Withdrawal Flags
-        private static readonly byte[] Mark = { 0x50 };
-        private static readonly byte[] Withdraw = { 0x51 };
-        private static readonly byte[] OpCode_TailCall = { 0x69 };
-        private static readonly byte Type_InvocationTransaction = 0xd1;
-        private static readonly byte TAUsage_WithdrawalStage = 0xa1;
-        private static readonly byte TAUsage_NEP5AssetID = 0xa2;
-        private static readonly byte TAUsage_SystemAssetID = 0xa3;
-        private static readonly byte TAUsage_WithdrawalAddress = 0xa4;
-        private static readonly byte TAUsage_AdditionalWitness = 0x20; // additional verification script which can be used to ensure any withdrawal txns are intended by the owner
-
-        // Byte Constants
-        private static readonly byte[] Empty = { };
         private static readonly byte[] Zeroes = { 0, 0, 0, 0, 0, 0, 0, 0 }; // for fixed8 (8 bytes)
         private static readonly byte[] Null = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // for fixed width list ptr (32bytes)        
-        private static readonly byte[] GasAssetID = { 231, 45, 40, 105, 121, 238, 108, 177, 183, 230, 93, 253, 223, 178, 227, 132, 16, 11, 141, 20, 142, 119, 88, 222, 66, 228, 22, 139, 113, 121, 44, 96 };
+        private static StorageContext Context() => Storage.CurrentContext;
+        private static BigInteger CurrentBucket() => Runtime.Time / stakeDuration;
 
         private struct Offer
         {
@@ -125,78 +113,54 @@ namespace switcheo
         /// </param>
         public static object Main(string operation, params object[] args)
         {
-            // Prepare vars
-            var currentTxn = (Transaction)ExecutionEngine.ScriptContainer;
-            var withdrawalStage = WithdrawalStage(currentTxn);
-
             if (Runtime.Trigger == TriggerType.Verification)
             {
-                if (GetState() != Active) return false;
+                // == Withdrawal of SystemAsset ==
+                // Check that the TransactionAttribute has been set to signify deduction for double withdrawal checks
+                var currentTxn = (Transaction)ExecutionEngine.ScriptContainer;
+                if (!IsWithdrawingSystemAsset(currentTxn)) return false;
 
-                var withdrawingAddr = GetWithdrawalAddress(currentTxn, withdrawalStage);
-                var assetID = GetWithdrawalAsset(currentTxn);
-                var isWithdrawingNEP5 = assetID.Length == 20;
-                var inputs = currentTxn.GetInputs();
+                // Verify that the contract is initialized
+                if (GetState() == Pending) return false;
+
+                // Get the withdrawing address
+                var withdrawingAddr = GetWithdrawalAddress(currentTxn);
+
+                // Verify that each output is allowed
                 var outputs = currentTxn.GetOutputs();
-
                 ulong totalOut = 0;
-                if (withdrawalStage == Mark)
+                foreach (var o in outputs)
                 {
-                    // Check that txn is signed
-                    if (!Runtime.CheckWitness(withdrawingAddr)) return false;
-
-                    // Check that withdrawal is possible
-                    if (!VerifyWithdrawal(withdrawingAddr, assetID)) return false;
-
-                    // Check that inputs are not already reserved
-                    foreach (var i in inputs)
-                    {
-                        if (Storage.Get(Context(), i.PrevHash.Concat(IndexAsByteArray(i.PrevIndex))).Length > 0) return false;
-                    }
-
-                    // Check that outputs are a valid self-send
-                    var authorizedAssetID = isWithdrawingNEP5 ? GasAssetID : assetID;
-                    foreach (var o in outputs)
-                    {
-                        totalOut += (ulong)o.Value;
-                        if (o.ScriptHash != ExecutionEngine.ExecutingScriptHash) return false;
-                        if (o.AssetId != authorizedAssetID) return false;
-                    }
-                    // TODO: should also check outputs.Length for SystemAsset (at most +1 of required)
-
-                    // Check that NEP5 withdrawals don't reserve more utxos than required
-                    if (isWithdrawingNEP5)
-                    {
-                        if (inputs.Length > 1) return false;
-                        if (outputs.Length > 2) return false;
-                        if (outputs[0].Value > 1) return false;
-                    }
+                    // Get amount for each asset
+                    var amount = GetAmountForAssetInOutputs(o.AssetId, outputs);
+                    // Verify that the output address owns the balance 
+                    if (!VerifyWithdrawal(withdrawingAddr, o.AssetId, amount)) return false;
+                    // Accumulate total for checking against inputs later
+                    totalOut += (ulong)o.Value;
                 }
-                else if (withdrawalStage == Withdraw)
-                {
-                    // Check that utxo has been reserved
-                    foreach (var i in inputs)
-                    {
-                        if (Storage.Get(Context(), i.PrevHash.Concat(IndexAsByteArray(i.PrevIndex))) != withdrawingAddr) return false;
-                    }
 
-                    // Check withdrawal destinations
-                    var authorizedAssetID = isWithdrawingNEP5 ? GasAssetID : assetID;
-                    var authorizedAddress = isWithdrawingNEP5 ? ExecutionEngine.ExecutingScriptHash : withdrawingAddr;
-                    foreach (var o in outputs)
-                    {
-                        totalOut += (ulong)o.Value;
-                        if (o.AssetId != authorizedAssetID) return false;
-                        if (o.ScriptHash != authorizedAddress) return false;
-                    }
+                // Check that all previous withdrawals has been cleared (SC amounts have been updated through invoke)
+                var startOfWithdrawal = (uint)Storage.Get(Context(), WithdrawalKey(withdrawingAddr)).AsBigInteger();
+                var currentHeight = Blockchain.GetHeight();
 
-                    // Check withdrawal amount
-                    var authorizedAmount = isWithdrawingNEP5 ? 1 : GetWithdrawAmount(withdrawingAddr, assetID);
-                    if (totalOut != authorizedAmount) return false;
-                }
-                else
+                // Check that start of withdrawal has been initiated previously
+                if (startOfWithdrawal == 0) return false;
+
+                // Check that withdrawal was not already done
+                for (var i = startOfWithdrawal; i < currentHeight; i++)
                 {
-                    return false;
+                    var block = Blockchain.GetBlock(i);
+                    var txns = block.GetTransactions();
+                    foreach (var transaction in txns)
+                    {
+                        // Since this is flagged as a withdrawal from this contract,
+                        // and it is signed by the withdrawing user,
+                        // we know that an withdrawal has already been executed without 
+                        // a corresponding application invocation to reduce balance,
+                        // therefore we should reject further withdrawals.
+                        if (IsWithdrawingSystemAsset(transaction) &&
+                            GetWithdrawalAddress(transaction) == withdrawingAddr) return false;
+                    }
                 }
 
                 // Ensure that nothing is burnt
@@ -204,62 +168,10 @@ namespace switcheo
                 foreach (var i in currentTxn.GetReferences()) totalIn += (ulong)i.Value;
                 if (totalIn != totalOut) return false;
 
-                // Check that Application trigger will be tail called
-                if (currentTxn.Type != Type_InvocationTransaction) return false;
-                var invocationTransaction = (InvocationTransaction)currentTxn;
-                if (invocationTransaction.Script != OpCode_TailCall.Concat(ExecutionEngine.ExecutingScriptHash)) return false; 
-
                 return true;
             }
             else if (Runtime.Trigger == TriggerType.Application)
             {
-                // == Withdrawal ==
-                if (withdrawalStage.Length > 0)
-                {
-                    var withdrawingAddr = GetWithdrawalAddress(currentTxn, withdrawalStage);
-                    var assetID = GetWithdrawalAsset(currentTxn);
-                    var isWithdrawingNEP5 = assetID.Length == 20;
-                    var inputs = currentTxn.GetInputs();
-                    var outputs = currentTxn.GetOutputs();
-
-                    if (withdrawalStage == Mark)
-                    {
-                        var amount = GetBalance(withdrawingAddr, assetID);
-                        MarkWithdrawal(withdrawingAddr, assetID, amount);
-                        if (isWithdrawingNEP5)
-                        {
-                            Storage.Put(Context(), currentTxn.Hash.Concat(IndexAsByteArray(0)), withdrawingAddr);
-                        }
-                        else
-                        {
-                            ulong sum = 0;
-                            for (ushort index = 0; index < outputs.Length; index++)
-                            {
-                                sum += (ulong)outputs[index].Value;
-                                Runtime.Log("Output check..");
-                                if (sum <= amount)
-                                {
-                                    Runtime.Log("Reserving...");
-                                    Storage.Put(Context(), currentTxn.Hash.Concat(IndexAsByteArray(index)), withdrawingAddr);
-                                }
-                            }
-                        }
-                        Withdrawing(withdrawingAddr, assetID, amount);
-                        return true;
-                    }
-                    else if (withdrawalStage == Withdraw)
-                    {
-                        foreach (var i in inputs)
-                        {
-                            Storage.Delete(Context(), i.PrevHash.Concat(IndexAsByteArray(i.PrevIndex)));
-                        }
-                        var amount = GetWithdrawAmount(withdrawingAddr, assetID);
-                        if (isWithdrawingNEP5 && !WithdrawNEP5(withdrawingAddr, assetID, amount)) return false; // TODO: if nep-5 withdraw fails for some reason funds can get stuck?
-                        Withdrawn(withdrawingAddr, assetID, amount);
-                        return true;
-                    }
-                }
-
                 // == Init ==
                 if (operation == "initialize")
                 {
@@ -279,11 +191,22 @@ namespace switcheo
                 if (operation == "getExchangeRate") return GetExchangeRate((byte[])args[0]);
                 if (operation == "getOffers") return GetOffers((byte[])args[0], (int)args[1]);
                 if (operation == "getBalance") return GetBalance((byte[])args[0], (byte[])args[1]);
+                if (operation == "getFeeBalance") return GetFeeBalance((byte[])args[0], (BigInteger)args[1]);
+                if (operation == "getTotalStaked") return GetTotalStaked((BigInteger)args[0]);
+                if (operation == "getStakeDetails")
+                {
+                    var stakerAddress = (byte[])args[0];
+                    return new BigInteger[] {
+                        Storage.Get(Context(), StakedAmountKey(stakerAddress)).AsBigInteger(),
+                        Storage.Get(Context(), StakedTimeKey(stakerAddress)).AsBigInteger()
+                    };
+                }
 
                 // == Execute ==
                 if (operation == "deposit")
                 {
                     if (GetState() != Active) return false;
+                    if (IsWithdrawingSystemAsset((Transaction)ExecutionEngine.ScriptContainer)) return false;
                     if (args.Length != 3) return false;
                     if (!VerifySentAmount((byte[])args[0], (byte[])args[1], (BigInteger)args[2])) return false;
                     TransferAssetTo((byte[])args[0], (byte[])args[1], (BigInteger)args[2]);
@@ -302,11 +225,73 @@ namespace switcheo
                     if (args.Length != 5) return false;
                     return FillOffer((byte[])args[0], (byte[])args[1], (byte[])args[2], (BigInteger)args[3], (bool)args[4]);
                 }
+                if (operation == "stakeTokens")
+                {
+                    if (GetState() != Active) return false;
+                    if (args.Length != 2) return false;
+                    return StakeTokens((byte[])args[0], (BigInteger)args[1]);
+                }
+                if (operation == "claimFees")
+                {
+                    if (GetState() != Active) return false;
+                    if (args.Length != 2) return false;
+                    return ClaimFees((byte[])args[0], (byte[][])args[1], (BigInteger)args[2]);
+                }
+                if (operation == "cancelStake")
+                {
+                    if (GetState() != Active) return false;
+                    if (args.Length != 1) return false;
+                    return CancelStake((byte[])args[0]);
+                }
+
+                // == Cancel / Withdraw ==
+                if (GetState() == Pending)
+                {
+                    Runtime.Log("Contract not initialized!");
+                    return false;
+                }
                 if (operation == "cancelOffer")
                 {
-                    if (GetState() == Pending) return false;
                     if (args.Length != 2) return false;
                     return CancelOffer((byte[])args[0], (byte[])args[1]);
+                }
+                if (operation == "withdrawAssets") // NEP-5 only
+                {
+                    if (args.Length != 3) return false;
+                    if (VerifyWithdrawal((byte[])args[0], (byte[])args[1], (BigInteger)args[2]))
+                    {
+                        return WithdrawAssets((byte[])args[0], (byte[])args[1], (BigInteger)args[2]);
+                    }
+                    else
+                    {
+                        Runtime.Log("Withdrawal is invalid!");
+                        return false;
+                    }
+                }
+                if (operation == "prepareAssetWithdrawal")
+                {
+                    if (args.Length != 1) return false;
+                    return PrepareAssetWithdrawal((byte[])args[0]);
+                }
+                if (operation == "completeAssetWithdrawal") // SystemAsset only
+                {
+                    var currentTxn = (Transaction)ExecutionEngine.ScriptContainer;
+                    if (!IsWithdrawingSystemAsset(currentTxn)) return false;
+
+                    var outputs = currentTxn.GetOutputs();
+                    foreach (var o in outputs)
+                    {
+                        if (o.ScriptHash != ExecutionEngine.ExecutingScriptHash)
+                        {
+                            Runtime.Log("Found a withdrawal..");
+                            if (!ReduceBalance(o.ScriptHash, o.AssetId, o.Value)) return false;
+                        }
+                    }
+
+                    var withdrawingAddr = GetWithdrawalAddress(currentTxn);
+                    Storage.Delete(Context(), WithdrawalKey(withdrawingAddr));
+
+                    return true;
                 }
 
                 // == Owner ==
@@ -335,21 +320,6 @@ namespace switcheo
                     if (args.Length != 1) return false;
                     return SetFeeAddress((byte[])args[0]);
                 }
-                if (operation == "addToWhitelist")
-                {
-                    if (args.Length != 1) return false;
-                    if (Storage.Get(Context(), "stateContractWhitelist") == Inactive) return false;
-                    Storage.Put(Context(), WhitelistKey((byte[])args[0]), "1");
-                }
-                if (operation == "removeFromWhitelist")
-                {
-                    if (args.Length != 1) return false;
-                    Storage.Delete(Context(), WhitelistKey((byte[])args[0]));
-                }
-                if (operation == "destroyWhitelist")
-                {
-                    Storage.Put(Context(), "stateContractWhitelist", Inactive);
-                }
             }
 
             return true;
@@ -362,6 +332,7 @@ namespace switcheo
             if (!SetFeeAddress(feeAddress)) return false;
 
             Storage.Put(Context(), "state", Active);
+            Storage.Put(Context(), StakedTotalKey(CurrentBucket()), 0);
 
             Runtime.Log("Contract initialized");
             return true;
@@ -384,12 +355,25 @@ namespace switcheo
 
         private static BigInteger GetBalance(byte[] originator, byte[] assetID)
         {
-            return Storage.Get(Context(), BalanceKey(originator, assetID)).AsBigInteger();
+            return Storage.Get(Context(), StoreKey(originator, assetID)).AsBigInteger();
         }
 
-        private static BigInteger GetWithdrawAmount(byte[] originator, byte[] assetID)
+        private static BigInteger GetFeeBalance(byte[] assetID, BigInteger bucketNumber)
         {
-            return Storage.Get(Context(), BalanceKey(originator, assetID)).AsBigInteger();
+            return Storage.Get(Context(), StoreKey(FeeAddressFor(bucketNumber), assetID)).AsBigInteger();
+        }
+
+        private static BigInteger GetTotalStaked(BigInteger bucketNumber)
+        {
+            var key = StakedTotalKey(bucketNumber);
+            var total = Storage.Get(Context(), key);
+            if (total.Length == 0)
+            {
+                var previousTotal = GetTotalStaked(bucketNumber - 1);
+                Storage.Put(Context(), key, previousTotal);
+                return previousTotal;
+            }
+            return total.AsBigInteger();
         }
 
         private static BigInteger[] GetExchangeRate(byte[] assetID) // against native token
@@ -401,14 +385,14 @@ namespace switcheo
             return new BigInteger[] { otherVolume, nativeVolume };
         }
 
-        private static byte[][] GetOffers(byte[] tradingPair, int count) // offerAssetID.Concat(wantAssetID)
+        private static Offer[] GetOffers(byte[] tradingPair, int count) // offerAssetID.Concat(wantAssetID)
         {
-            var result = new byte[count][]; // TODO: dynamic initialization doesn't work?
+            var result = new Offer[50]; // TODO: dynamic initialization doesn't work?
             var i = 0;
             var it = Storage.Find(Context(), tradingPair);
             do
             {
-                result[i] = it.Value;
+                result[i] = (Offer)Runtime.Deserialize(it.Value);
             } while (it.Next() != null && i < count && i < 50);
 
             return result;
@@ -475,19 +459,26 @@ namespace switcheo
             {
                 // Notify clients of failure
                 Failed(fillerAddress, offerHash);
-                return true;
+                return true; // TODO: can we return false?
             }
 
             // Reduce available balance for the filled asset and amount
             if (!ReduceBalance(fillerAddress, offer.WantAssetID, amountToFill)) return false;
 
             // Calculate offered amount and fees
-            byte[] feeAddress = Storage.Get(Context(), "feeAddress");
             BigInteger makerFeeRate = GetMakerFee();
             BigInteger takerFeeRate = GetTakerFee();
             BigInteger makerFee = (amountToFill * makerFeeRate) / feeFactor;
             BigInteger takerFee = (amountToOffer * takerFeeRate) / feeFactor;
-            BigInteger nativeFee = 0;
+
+            // Move fees
+            var feeAddress = FeeAddressFor(CurrentBucket());
+            TransferAssetTo(feeAddress, offer.WantAssetID, makerFee);
+            TransferAssetTo(feeAddress, offer.OfferAssetID, takerFee);
+
+            // Move asset to the maker balance and notify clients
+            TransferAssetTo(offer.MakerAddress, offer.WantAssetID, amountToFill - makerFee);
+            Transferred(offer.MakerAddress, offer.WantAssetID, amountToFill - makerFee);
 
             // Move asset to the taker balance and notify clients
             if (useNativeTokens)
@@ -498,34 +489,21 @@ namespace switcheo
                 // Derive rate from volumes traded
                 var nativeVolume = Storage.Get(Context(), NativeVolumeKey(offer.OfferAssetID, bucketNumber)).AsBigInteger();
                 var otherVolume = Storage.Get(Context(), ForeignVolumeKey(offer.OfferAssetID, bucketNumber)).AsBigInteger();
-
-                // Use native fee, if we can get an exchange rate
+                BigInteger nativeFee = 0;
                 if (otherVolume > 0)
                 {
+                    // use native fee, if we can get an exchange rate
                     nativeFee = (takerFee * nativeVolume) / (otherVolume * nativeTokenDiscount);
                 }
-
-                // Reduce balance immediately from taker
-                if (!ReduceBalance(fillerAddress, NativeToken, nativeFee))
-                {
-                    // Reset to 0 if balance is insufficient
-                    nativeFee = 0;
-                }
+                ReduceBalance(fillerAddress, NativeToken, nativeFee);
+                TransferAssetTo(fillerAddress, offer.OfferAssetID, amountToOffer);
+                Transferred(fillerAddress, offer.OfferAssetID, amountToOffer);
             }
-
-            // Move asset to the taker balance and notify clients
-            var takerAmount = amountToOffer - (nativeFee > 0 ? 0 : takerFee);
-            TransferAssetTo(fillerAddress, offer.OfferAssetID, takerAmount);
-            Transferred(fillerAddress, offer.OfferAssetID, takerAmount);
-
-            // Move asset to the maker balance and notify clients
-            var makerAmount = amountToFill - makerFee;
-            TransferAssetTo(offer.MakerAddress, offer.WantAssetID, makerAmount);
-            Transferred(offer.MakerAddress, offer.WantAssetID, makerAmount);
-
-            // Move fees
-            TransferAssetTo(feeAddress, offer.WantAssetID, makerFee);
-            if (nativeFee == 0) TransferAssetTo(feeAddress, offer.OfferAssetID, takerFee);
+            else
+            {
+                TransferAssetTo(fillerAddress, offer.OfferAssetID, amountToOffer - takerFee);
+                Transferred(fillerAddress, offer.OfferAssetID, amountToOffer - takerFee);
+            }
 
             // Update native token exchange rate
             if (offer.OfferAssetID == NativeToken)
@@ -589,7 +567,147 @@ namespace switcheo
             Cancelled(offer.MakerAddress, offerHash);
             return true;
         }
-                        
+
+        private static bool VerifyWithdrawal(byte[] holderAddress, byte[] assetID, BigInteger amount)
+        {
+            // Check that there are asset value > 0 in balance
+            var balance = GetBalance(holderAddress, assetID);
+            if (balance < amount) return false;
+
+            return true;
+        }
+
+        private static bool WithdrawAssets(byte[] holderAddress, byte[] assetID, BigInteger amount)
+        {
+            // Transfer token
+            var args = new object[] { ExecutionEngine.ExecutingScriptHash, holderAddress, amount };
+            var contract = (NEP5Contract)assetID.ToDelegate();
+            bool transferSuccessful = (bool)contract("transfer", args);
+            if (!transferSuccessful)
+            {
+                Runtime.Log("Failed to transfer NEP-5 tokens!");
+                return false;
+            }
+
+            // Reduce balance in storage
+            if (!ReduceBalance(holderAddress, assetID, amount)) return false;
+
+            // Notify clients
+            Withdrawn(holderAddress, assetID, amount);
+
+            return true;
+        }
+
+        private static bool PrepareAssetWithdrawal(byte[] holderAddress)
+        {
+            // Check that transaction is signed by the asset holder
+            if (!Runtime.CheckWitness(holderAddress)) return false;
+
+            // Get the key which marks start of withdrawal process
+            var withdrawalKey = WithdrawalKey(holderAddress);
+
+            // Check if already withdrawing
+            if (Storage.Get(Context(), withdrawalKey) != Empty) return false;
+
+            // Set blockheight from which to check for double withdrawals later on
+            Storage.Put(Context(), withdrawalKey, Blockchain.GetHeight());
+
+            Runtime.Log("Prepared for asset withdrawal");
+
+            return true;
+        }
+
+        private static bool StakeTokens(byte[] stakerAddress, BigInteger amount)
+        {
+            // Check that transaction is signed by the staker
+            if (!Runtime.CheckWitness(stakerAddress)) return false;
+
+            // Stake tokens from contract balance
+            if (!ReduceBalance(stakerAddress, NativeToken, amount)) return false;
+
+            // Get the next available bucket for staking
+            BigInteger bucketNumber = CurrentBucket();
+
+            // Get staking keys
+            var stakedAmountKey = StakedAmountKey(stakerAddress);
+            var stakedTimeKey = StakedTimeKey(stakerAddress);
+
+            // Get staking values
+            var stakedAmount = Storage.Get(Context(), stakedAmountKey).AsBigInteger();
+            var stakedTime = Storage.Get(Context(), stakedTimeKey).AsBigInteger();
+            var stakedTotal = GetTotalStaked(bucketNumber);
+
+            // Don't allow re-staking - must claim and cancel first
+            if (stakedAmount > 0 || stakedTime > 0) return false;
+
+            // Update individual staked amount
+            Storage.Put(Context(), stakedAmountKey, amount);
+
+            // Update start time of staking
+            Storage.Put(Context(), stakedTimeKey, bucketNumber);
+
+            // Update total amount staked in the next bucket
+            Storage.Put(Context(), StakedTotalKey(bucketNumber), stakedTotal + amount);
+
+            return true;
+        }
+
+        private static bool ClaimFees(byte[] claimerAddress, byte[][] assetIDs, BigInteger bucketNumber)
+        {
+            // Get staking details
+            var stakedAmount = Storage.Get(Context(), StakedAmountKey(claimerAddress)).AsBigInteger();
+            var stakedTime = Storage.Get(Context(), StakedTimeKey(claimerAddress)).AsBigInteger();
+            var stakedTotal = GetTotalStaked(bucketNumber);
+
+            // Check that the claim is valid
+            BigInteger currentBucketNumber = CurrentBucket();
+            if (stakedAmount <= 0 || stakedTime < bucketNumber || bucketNumber >= currentBucketNumber) return false;
+
+            // Move fees from fee addr to claimer addr
+            foreach (byte[] assetID in assetIDs)
+            {
+                var feeAddress = FeeAddressFor(bucketNumber);
+                var feesKey = StoreKey(feeAddress, assetID);
+                var totalFees = Storage.Get(Context(), feesKey).AsBigInteger();
+                var claimableAmount = totalFees * stakedAmount / stakedTotal;
+                if (claimableAmount > 0)
+                {
+                    TransferAssetTo(claimerAddress, assetID, claimableAmount);
+                    if (!ReduceBalance(feeAddress, assetID, claimableAmount)) return false;
+                }
+            }
+
+            // Update staked time
+            Storage.Put(Context(), StakedTimeKey(claimerAddress), bucketNumber + 1);
+
+            return true;
+        }
+
+        private static bool CancelStake(byte[] stakerAddress)
+        {
+            // Get the next available bucket for staking
+            BigInteger bucketNumber = CurrentBucket();
+
+            // Save staked amount and then remove it
+            var stakedAmountKey = StakedAmountKey(stakerAddress);
+            var stakedAmount = Storage.Get(Context(), stakedAmountKey).AsBigInteger();
+            Storage.Delete(Context(), stakedAmountKey);
+
+            // Clean up associated timing
+            var stakedTimeKey = StakedTime.Concat(stakerAddress);
+            Storage.Delete(Context(), stakedTimeKey);
+
+            // Reduce total staked
+            var stakedTotalKey = StakedTotal.Concat(bucketNumber.AsByteArray());
+            var stakedTotal = Storage.Get(Context(), stakedTotalKey).AsBigInteger();
+            Storage.Put(Context(), stakedTotalKey, stakedTotal - stakedAmount);
+
+            // Allow withdrawing of previously staked asset
+            TransferAssetTo(stakerAddress, NativeToken, stakedAmount);
+
+            return true;
+        }
+
         private static bool SetFees(BigInteger takerFee, BigInteger makerFee)
         {
             if (takerFee > maxFee || makerFee > maxFee) return false;
@@ -605,17 +723,6 @@ namespace switcheo
         {
             if (feeAddress.Length != 20) return false;
             Storage.Put(Context(), "feeAddress", feeAddress);
-
-            return true;
-        }
-
-        private static bool VerifyWithdrawal(byte[] holderAddress, byte[] assetID)
-        {
-            var balance = GetBalance(holderAddress, assetID);
-            if (balance <= 0) return false;
-
-            var withdrawingAmount = GetWithdrawAmount(holderAddress, assetID);
-            if (withdrawingAmount > 0) return false;
 
             return true;
         }
@@ -655,7 +762,6 @@ namespace switcheo
             else if (assetID.Length == 20)
             {
                 // Just transfer immediately or fail as this is the last step in verification
-                if (!VerifyContract(assetID)) return false;
                 var args = new object[] { originator, ExecutionEngine.ExecutingScriptHash, amount };
                 var Contract = (NEP5Contract)assetID.ToDelegate();
                 var transferSuccessful = (bool)Contract("transfer", args);
@@ -666,17 +772,12 @@ namespace switcheo
             return false;
         }
 
-        private static bool VerifyContract(byte[] assetID)
-        {
-            if (Storage.Get(Context(), "stateContractWhitelist") == Inactive) return true;
-            return Storage.Get(Context(), WhitelistKey(assetID)).Length > 0;
-        }
-
         private static Offer GetOffer(byte[] tradingPair, byte[] hash)
         {
             byte[] offerData = Storage.Get(Context(), tradingPair.Concat(hash));
             if (offerData.Length == 0) return new Offer();
 
+            Runtime.Log("Deserializing offer");
             return (Offer)Runtime.Deserialize(offerData);
         }
 
@@ -691,7 +792,10 @@ namespace switcheo
             else
             {
                 // Serialize offer
+                Runtime.Log("Serializing offer");
                 var offerData = Runtime.Serialize(offer);
+                Runtime.Log("Done serializing offer");
+                Runtime.Notify("offerData", offerData);
                 Storage.Put(Context(), tradingPair.Concat(offerHash), offerData);
             }
         }
@@ -702,6 +806,44 @@ namespace switcheo
             Storage.Delete(Context(), tradingPair.Concat(offerHash));
         }
 
+        private static ulong GetAmountForAssetInOutputs(byte[] assetID, TransactionOutput[] outputs)
+        {
+            ulong amount = 0;
+            foreach (var o in outputs)
+            {
+                if (o.AssetId == assetID && o.ScriptHash != ExecutionEngine.ExecutingScriptHash) amount += (ulong)o.Value;
+            }
+
+            return amount;
+        }
+
+        private static byte[] GetWithdrawalAddress(Transaction transaction)
+        {
+            var txnAttributes = transaction.GetAttributes();
+            foreach (var attr in txnAttributes)
+            {
+                // This is the additional verification script which can be used
+                // to ensure any withdrawal txns are intended by the owner.
+                if (attr.Usage == 0x20) return attr.Data.Take(20);
+            }
+            return Empty;
+        }
+
+        private static bool IsWithdrawingSystemAsset(Transaction transaction)
+        {
+            // Check that transaction is an Invocation transaction
+            if (transaction.Type != 0xd1) return false;
+
+            // Check that the transaction is marked as a SystemAsset withdrawal
+            var txnAttributes = transaction.GetAttributes();
+            foreach (var attr in txnAttributes)
+            {
+                if (attr.Usage == 0xa1 && attr.Data.Take(20) == ExecutionEngine.ExecutingScriptHash) return true;
+            }
+
+            return false;
+        }
+
         private static void TransferAssetTo(byte[] originator, byte[] assetID, BigInteger amount)
         {
             if (amount < 1)
@@ -710,7 +852,7 @@ namespace switcheo
                 return;
             }
 
-            byte[] key = BalanceKey(originator, assetID);
+            byte[] key = StoreKey(originator, assetID);
             BigInteger currentBalance = Storage.Get(Context(), key).AsBigInteger();
             Storage.Put(Context(), key, currentBalance + amount);
         }
@@ -723,7 +865,7 @@ namespace switcheo
                 return false;
             }
 
-            var key = BalanceKey(address, assetID);
+            var key = StoreKey(address, assetID);
             var currentBalance = Storage.Get(Context(), key).AsBigInteger();
             var newBalance = currentBalance - amount;
 
@@ -737,67 +879,6 @@ namespace switcheo
             else Storage.Delete(Context(), key);
 
             return true;
-        }
-
-        private static bool MarkWithdrawal(byte[] address, byte[] assetID, BigInteger amount)
-        {
-            Runtime.Log("Checking Last Mark..");
-            if (!VerifyWithdrawal(address, assetID)) return false;
-
-            Runtime.Log("Marking Withdrawal..");
-            var balance = GetBalance(address, assetID);            
-            Storage.Delete(Context(), BalanceKey(address, assetID));
-            Storage.Put(Context(), WithdrawKey(address, assetID), balance);
-
-            return true;
-        }
-
-        private static bool WithdrawNEP5(byte[] address, byte[] assetID, BigInteger amount)
-        {
-            // Transfer token
-            if (!VerifyContract(assetID)) return false;
-            var args = new object[] { ExecutionEngine.ExecutingScriptHash, address, amount };
-            var contract = (NEP5Contract)assetID.ToDelegate();
-            bool transferSuccessful = (bool)contract("transfer", args);
-            if (!transferSuccessful)
-            {
-                Runtime.Log("Failed to transfer NEP-5 tokens!");
-                return false;
-            }
-
-            return true;
-        }
-
-        private static byte[] GetWithdrawalAddress(Transaction transaction, byte[] withdrawalStage)
-        {
-            var usage = withdrawalStage == Mark ? TAUsage_AdditionalWitness : TAUsage_WithdrawalAddress;
-            var txnAttributes = transaction.GetAttributes();
-            foreach (var attr in txnAttributes)
-            {
-                if (attr.Usage == usage) return attr.Data.Take(20);
-            }
-            return Empty;
-        }
-
-        private static byte[] GetWithdrawalAsset(Transaction transaction)
-        {
-            var txnAttributes = transaction.GetAttributes();
-            foreach (var attr in txnAttributes)
-            {
-                if (attr.Usage == TAUsage_NEP5AssetID) return attr.Data.Take(20);
-                if (attr.Usage == TAUsage_SystemAssetID) return attr.Data;
-            }
-            return Empty;
-        }
-
-        private static byte[] WithdrawalStage(Transaction transaction)
-        {
-            var txnAttributes = transaction.GetAttributes();
-            foreach (var attr in txnAttributes)
-            {
-                if (attr.Usage == TAUsage_WithdrawalStage) return attr.Data.Take(1);
-            }
-            return Empty;
         }
 
         private static BigInteger AmountToOffer(Offer o, BigInteger amount)
@@ -816,17 +897,14 @@ namespace switcheo
             return Hash256(bytes);
         }
 
-        // Helpers
-        private static StorageContext Context() => Storage.CurrentContext;
-        private static BigInteger CurrentBucket() => Runtime.Time / bucketDuration;
-        private static byte[] IndexAsByteArray(ushort index) => index > 0 ? ((BigInteger)index).AsByteArray() : Empty;
-        private static byte[] TradingPair(Offer o) => o.OfferAssetID.Concat(o.WantAssetID);
-
-        // Keys
-        private static byte[] WhitelistKey(byte[] assetID) => "contractWhitelist".AsByteArray().Concat(assetID);
-        private static byte[] BalanceKey(byte[] originator, byte[] assetID) => originator.Concat(assetID);
-        private static byte[] WithdrawKey(byte[] originator, byte[] assetID) => originator.Concat(assetID).Concat(Withdraw);
+        private static byte[] StoreKey(byte[] originator, byte[] assetID) => originator.Concat(assetID);
+        private static byte[] WithdrawalKey(byte[] originator) => originator.Concat(Withdrawing);
         private static byte[] ForeignVolumeKey(byte[] assetID, BigInteger bucketNumber) => assetID.Concat(Foreign).Concat(bucketNumber.AsByteArray());
         private static byte[] NativeVolumeKey(byte[] assetID, BigInteger bucketNumber) => assetID.Concat(Native).Concat(bucketNumber.AsByteArray());
+        private static byte[] StakedAmountKey(byte[] staker) => StakedAmount.Concat(staker);
+        private static byte[] StakedTimeKey(byte[] staker) => StakedTime.Concat(staker);
+        private static byte[] StakedTotalKey(BigInteger bucketNumber) => StakedTotal.Concat(bucketNumber.AsByteArray());
+        private static byte[] FeeAddressFor(BigInteger bucketNumber) => FeesAccumulated.Concat(bucketNumber.AsByteArray());
+        private static byte[] TradingPair(Offer o) => o.OfferAssetID.Concat(o.WantAssetID);
     }
 }
