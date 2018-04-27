@@ -16,7 +16,7 @@ namespace switcheo
         public static event Action<byte[], byte[], byte[], BigInteger, byte[], BigInteger> Created; // (address, offerHash, offerAssetID, offerAmount, wantAssetID, wantAmount)
 
         [DisplayName("filled")]
-        public static event Action<byte[], byte[], BigInteger, byte[], BigInteger, byte[], BigInteger, BigInteger, BigInteger> Filled; // (address, offerHash, fillAmount, offerAssetID, offerAmount, wantAssetID, wantAmount, amountToTake, makerFee, makerFeeAssetID, takerFee, takerFeeAssetID)
+        public static event Action<byte[], byte[], BigInteger, byte[], BigInteger, byte[], BigInteger> Filled; // (address, offerHash, fillAmount, offerAssetID, offerAmount, wantAssetID, wantAmount)
 
         [DisplayName("failed")]
         public static event Action<byte[], byte[]> Failed; // (address, offerHash)
@@ -32,24 +32,6 @@ namespace switcheo
 
         [DisplayName("withdrawn")]
         public static event Action<byte[], byte[], BigInteger> Withdrawn; // (address, assetID, amount)
-
-        [DisplayName("volumeAdded")]
-        public static event Action<byte[], BigInteger, BigInteger> VolumeAdded; // (assetID, nativeAmount, foreignAmount)
-
-        [DisplayName("balanceReduced")]
-        public static event Action<byte[], byte[], BigInteger> BalanceReduced; // (address, assetID, amount)
-
-        [DisplayName("tradingFrozen")]
-        public static event Action TradingFrozen;
-
-        [DisplayName("tradingResumed")]
-        public static event Action TradingResumed;
-
-        [DisplayName("addedToWhitelist")]
-        public static event Action<byte[]> AddedToWhitelist; // (scriptHash)
-
-        [DisplayName("whitelistDestroyed")]
-        public static event Action WhitelistDestroyed;
 
         // Broker Settings & Hardcaps
         private static readonly byte[] Owner = "Ae6LkR5TLXVVAE5WSRqAEDEYBx6ChBE6Am".ToScriptHash();
@@ -147,7 +129,16 @@ namespace switcheo
         /// </param>
         public static object Main(string operation, params object[] args)
         {
-            if (Runtime.Trigger == TriggerType.Verification)
+            if (Runtime.Trigger == TriggerType.VerificationR)
+            {
+                // verify that no invocation (TriggerType.Application) (i.e. no invoke script) will be made if there is an input not from contract
+            }
+            else if (Runtime.Trigger == TriggerType.ApplicationR)
+            {
+                // count inputs
+                // for each, do depositSystemAsset(asset_id, amount)
+            }
+            else if (Runtime.Trigger == TriggerType.Verification)
             {
                 if (GetState() == Pending) return false;
 
@@ -248,15 +239,14 @@ namespace switcheo
 
                 // == Getters ==
                 if (operation == "getState") return GetState();
-                if (operation == "getMakerFee") return GetMakerFee(Empty);
-                if (operation == "getTakerFee") return GetTakerFee(Empty);
+                if (operation == "getMakerFee") return GetMakerFee(args.Length == 1 ? (byte[])args[0] : Empty);
+                if (operation == "getTakerFee") return GetTakerFee(args.Length == 1 ? (byte[])args[0] : Empty);
                 if (operation == "getExchangeRate") return GetExchangeRate((byte[])args[0]);
                 if (operation == "getOffers") return GetOffers((byte[])args[0], (byte[])args[1]);
-                if (operation == "getOffer") return GetOffer((byte[])args[0], (byte[])args[1]);
                 if (operation == "getBalance") return GetBalance((byte[])args[0], (byte[])args[1]);
 
-                // == Execute ==
-                if (operation == "deposit")
+                // == Execute == 
+                if (operation == "deposit") // NEP-5 ONLY
                 {
                     if (GetState() != Active) return false;
                     if (args.Length != 3) return false;
@@ -297,13 +287,11 @@ namespace switcheo
                 if (operation == "freezeTrading")
                 {
                     Storage.Put(Context(), "state", Inactive);
-                    TradingFrozen();
                     return true;
                 }
                 if (operation == "unfreezeTrading")
                 {
                     Storage.Put(Context(), "state", Active);
-                    TradingResumed();
                     return true;
                 }
                 if (operation == "setMakerFee")
@@ -316,6 +304,11 @@ namespace switcheo
                     if (args.Length != 2) return false;
                     return SetTakerFee((BigInteger)args[0], (byte[])args[1]);
                 }
+                if (operation == "resetTakerFee")
+                {
+                    if (args.Length != 2) return false;
+                    return ResetTakerFee((byte[])args[0]);
+                }
                 if (operation == "setFeeAddress")
                 {
                     if (args.Length != 1) return false;
@@ -325,14 +318,11 @@ namespace switcheo
                 {
                     if (args.Length != 1) return false;
                     if (Storage.Get(Context(), "stateContractWhitelist") == Inactive) return false;
-                    byte[] scriptHash = (byte[])args[0];
-                    Storage.Put(Context(), WhitelistKey(scriptHash), "1");
-                    AddedToWhitelist(scriptHash);
+                    Storage.Put(Context(), WhitelistKey((byte[])args[0]), "1");
                 }
                 if (operation == "destroyWhitelist")
                 {
                     Storage.Put(Context(), "stateContractWhitelist", Inactive);
-                    WhitelistDestroyed();
                 }
             }
 
@@ -520,10 +510,12 @@ namespace switcheo
             // Move asset to the taker balance and notify clients
             var takerAmount = amountToTake - (nativeFee > 0 ? 0 : takerFee);
             TransferAssetTo(fillerAddress, offer.OfferAssetID, takerAmount);
+            Transferred(fillerAddress, offer.OfferAssetID, takerAmount);
 
             // Move asset to the maker balance and notify clients
             var makerAmount = amountToFill - makerFee;
             TransferAssetTo(offer.MakerAddress, offer.WantAssetID, makerAmount);
+            Transferred(offer.MakerAddress, offer.WantAssetID, makerAmount);
 
             // Move fees
             if (makerFee > 0) TransferAssetTo(feeAddress, offer.WantAssetID, makerFee);
@@ -546,7 +538,7 @@ namespace switcheo
             StoreOffer(tradingPair, offerHash, offer);
 
             // Notify clients
-            Filled(fillerAddress, offerHash, amountToFill, offer.OfferAssetID, offer.OfferAmount, offer.WantAssetID, offer.WantAmount, amountToTake, nativeFee);
+            Filled(fillerAddress, offerHash, amountToFill, offer.OfferAssetID, offer.OfferAmount, offer.WantAssetID, offer.WantAmount);
             return true;
         }
 
@@ -586,6 +578,13 @@ namespace switcheo
             if (fee < 0) return false;
 
             Storage.Put(Context(), "takerFee".AsByteArray().Concat(assetID), fee);
+
+            return true;
+        }
+
+        private static bool ResetTakerFee(byte[] assetID)
+        {
+            Storage.Delete(Context(), "takerFee".AsByteArray().Concat(assetID));
 
             return true;
         }
@@ -711,7 +710,6 @@ namespace switcheo
                 var args = new object[] { originator, ExecutionEngine.ExecutingScriptHash, amount };
                 var Contract = (NEP5Contract)assetID.ToDelegate();
                 var transferSuccessful = (bool)Contract("transfer", args);
-                // TODO: need event?
                 return transferSuccessful;
             }
 
@@ -757,7 +755,7 @@ namespace switcheo
             Storage.Delete(Context(), tradingPair.Concat(offerHash));
         }
 
-        private static void TransferAssetTo(byte[] originator, byte[] assetID, BigInteger amount)
+        private static void TransferAssetTo(byte[] originator, byte[] assetID, BigInteger amount, string reason)
         {
             if (amount < 1)
             {
@@ -768,10 +766,10 @@ namespace switcheo
             byte[] key = BalanceKey(originator, assetID);
             BigInteger currentBalance = Storage.Get(Context(), key).AsBigInteger();
             Storage.Put(Context(), key, currentBalance + amount);
-            Transferred(originator, assetID, amount);
+
         }
 
-        private static bool ReduceBalance(byte[] address, byte[] assetID, BigInteger amount)
+        private static bool ReduceBalance(byte[] address, byte[] assetID, BigInteger amount, string reason)
         {
             if (amount < 1)
             {
@@ -791,7 +789,6 @@ namespace switcheo
 
             if (newBalance > 0) Storage.Put(Context(), key, newBalance);
             else Storage.Delete(Context(), key);
-            BalanceReduced(address, assetID, amount);
 
             return true;
         }
@@ -802,7 +799,7 @@ namespace switcheo
             if (!VerifyWithdrawal(address, assetID)) return false;
 
             Runtime.Log("Marking Withdrawal..");  
-            if (!ReduceBalance(address, assetID, amount)) return false;
+            if (!ReduceBalance(address, assetID, amount, "withdrawing")) return false;
             Storage.Put(Context(), WithdrawKey(address, assetID), amount);
 
             return true;
@@ -815,7 +812,6 @@ namespace switcheo
             var args = new object[] { ExecutionEngine.ExecutingScriptHash, address, amount };
             var contract = (NEP5Contract)assetID.ToDelegate();
             bool transferSuccessful = (bool)contract("transfer", args);
-
             if (!transferSuccessful)
             {
                 Runtime.Log("Failed to transfer NEP-5 tokens!");
@@ -901,7 +897,6 @@ namespace switcheo
 
             // Save to blockchain
             Storage.Put(Context(), volumeKey, volume.Serialize());
-            VolumeAdded(assetID, nativeAmount, foreignAmount);
             Runtime.Log("Done serializing and storing");
 
             return true;
